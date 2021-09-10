@@ -1,0 +1,114 @@
+#REGTEST_TYPE=devel
+
+# This reg-test uses the "add ssl crt-list" command to add a certificate over the CLI.
+# It requires socat to upload the certificate
+
+# this check does 2 requests, the first one will use "www.test1.com" as SNI, and
+# the second one will use "localhost". Since vtest can't do SSL, we use haproxy
+# as an SSL client with 2 chained listen section.
+
+# If this test does not work anymore:
+# - Check that you have socat
+
+varnishtest "Test the 'add ssl crt-list' feature of the CLI"
+#REQUIRE_VERSION=2.2
+#REQUIRE_OPTIONS=OPENSSL
+#REQUIRE_BINARIES=socat
+feature ignore_unknown_macro
+
+server s1 -repeat 2 {
+    rxreq
+    txresp
+} -start
+
+haproxy h1 -conf {
+    global
+        tune.ssl.default-dh-param 2048
+        tune.ssl.capture-cipherlist-size 1
+        crt-base ${testdir}
+        stats socket "${tmpdir}/h1/stats" level admin
+
+    defaults
+        mode http
+        option httplog
+        ${no-htx} option http-use-htx
+        log stderr local0 debug err
+        option logasap
+        timeout connect 1s
+        timeout client  1s
+        timeout server  1s
+
+
+    listen clear-lst
+        bind "fd@${clearlst}"
+        balance roundrobin
+        server s1 "${tmpdir}/ssl.sock" ssl verify none sni str(www.test1.com)
+        server s2 "${tmpdir}/ssl.sock" ssl verify none sni str(localhost)
+
+
+    listen ssl-lst
+        mode http
+        ${no-htx} option http-use-htx
+        bind "${tmpdir}/ssl.sock" ssl strict-sni crt-list ${testdir}/localhost.crt-list
+
+        server s1 ${s1_addr}:${s1_port}
+} -start
+
+
+haproxy h1 -cli {
+    send "show ssl cert ${testdir}/common.pem"
+    expect ~ ".*SHA1 FingerPrint: 2195C9F0FD58470313013FC27C1B9CF9864BD1C6"
+}
+
+client c1 -connect ${h1_clearlst_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+shell {
+    echo "new ssl cert ${testdir}/ecdsa.pem" | socat "${tmpdir}/h1/stats" -
+    printf "set ssl cert ${testdir}/ecdsa.pem <<\n$(cat ${testdir}/ecdsa.pem)\n\n" | socat "${tmpdir}/h1/stats" -
+    echo "commit ssl cert ${testdir}/ecdsa.pem" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl crt-list ${testdir}/localhost.crt-list/ <<\n${testdir}/ecdsa.pem [ssl-min-ver SSLv3 verify none allow-0rtt] localhost !www.test1.com\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl crt-list ${testdir}/localhost.crt-list <<\n${testdir}/ecdsa.pem [verify none allow-0rtt]\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl crt-list ${testdir}/localhost.crt-list/// <<\n${testdir}/ecdsa.pem localhost !www.test1.com\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl crt-list ${testdir}/localhost.crt-list///// <<\n${testdir}/ecdsa.pem\n\n" | socat "${tmpdir}/h1/stats" -
+    printf "add ssl crt-list ${testdir}/localhost.crt-list// ${testdir}/ecdsa.pem\n" | socat "${tmpdir}/h1/stats" -
+}
+
+haproxy h1 -cli {
+    send "show ssl cert ${testdir}/ecdsa.pem"
+    expect ~ ".*SHA1 FingerPrint: A490D069DBAFBEE66DE434BEC34030ADE8BCCBF1"
+}
+
+haproxy h1 -cli {
+    send "show ssl crt-list ${testdir}/localhost.crt-list//"
+    # check the options and the filters in any order
+    expect ~ ".*${testdir}/ecdsa.pem \\[(?=.*verify none)(?=.*allow-0rtt)(?=.*ssl-min-ver SSLv3).*\\](?=.*!www.test1.com)(?=.*localhost).*"
+}
+
+client c1 -connect ${h1_clearlst_sock} {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+
+# Try to add a new line that mentions an "unknown" CA file (not loaded yet).
+# It should fail since no disk access are allowed during runtime.
+shell {
+    printf "add ssl crt-list ${testdir}/localhost.crt-list/ <<\n${testdir}/ecdsa.pem [ca-file ${testdir}/ca-auth.crt] localhost\n\n" | socat "${tmpdir}/h1/stats" - | grep "unable to load ${testdir}/ca-auth.crt"
+}
+shell {
+    printf "add ssl crt-list ${testdir}/localhost.crt-list/ <<\n${testdir}/ecdsa.pem [ca-verify-file ${testdir}/ca-auth.crt] localhost\n\n" | socat "${tmpdir}/h1/stats" - | grep "unable to load ${testdir}/ca-auth.crt"
+}
+shell {
+    printf "add ssl crt-list ${testdir}/localhost.crt-list/ <<\n${testdir}/ecdsa.pem [crl-file ${testdir}/ca-auth.crt] localhost\n\n" | socat "${tmpdir}/h1/stats" - | grep "unable to load ${testdir}/ca-auth.crt"
+}
+
+# Check that the new line was not added to the crt-list.
+haproxy h1 -cli {
+    send "show ssl crt-list ${testdir}/localhost.crt-list//"
+    expect !~ ".*ca-file ${testdir}/ca-auth.crt"
+}
